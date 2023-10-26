@@ -35,7 +35,6 @@ import org.redisson.client.protocol.Encoder;
 
 import cloud.orbit.actors.cluster.pipeline.RedisPipelineStep;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
 
 import java.io.IOException;
 import java.util.List;
@@ -58,36 +57,35 @@ public class RedisPipelineCodec implements Codec
         @Override
         public Object decode(ByteBuf buf, State state) throws IOException
         {
-            final int rawLength = buf.readableBytes();
-            final byte[] rawBytes = new byte[rawLength];
-            buf.readBytes(rawBytes);
-
-            final ListIterator li = pipelineSteps.listIterator(pipelineSteps.size());
-            
-            byte[] conversionBytes = rawBytes;
-
+            // We must retain the original buffer, since the read method of the pipeline step
+            // always calls release on the input buffer. By incrementing the reference count, the release in the read() method
+            // will put the refCnt back to 1 which is what it was when we received it originally.
+            // For the subsequent calls that we make, the release on the input buffer is fine, since we created the previous input buffer, not the caller.
+            buf.retain();
+            final ListIterator<RedisPipelineStep> li = pipelineSteps.listIterator(pipelineSteps.size());
             while (li.hasPrevious()) {
-                final RedisPipelineStep pipelineStep = (RedisPipelineStep) li.previous();
-                conversionBytes = pipelineStep.read(conversionBytes);
+                buf = li.previous().read(buf);
             }
-
-            final ByteBuf bf = Unpooled.wrappedBuffer(conversionBytes);
-
-            return innerCodec.getValueDecoder().decode(bf, state);
+            try
+            {
+                return innerCodec.getValueDecoder().decode(buf, state);
+            }
+            finally
+            {
+                buf.release();
+            }
         }
     };
 
     private final Encoder encoder = new Encoder() {
         @Override
-        public byte[] encode(Object in) throws IOException {
-            byte[] conversionBytes = innerCodec.getValueEncoder().encode(in);
-
+        public ByteBuf encode(Object in) throws IOException {
+            ByteBuf byteBuf = innerCodec.getValueEncoder().encode(in);
             for (final RedisPipelineStep pipelineStep : pipelineSteps)
             {
-                conversionBytes = pipelineStep.write(conversionBytes);
+                byteBuf = pipelineStep.write(byteBuf);
             }
-
-            return conversionBytes;
+            return byteBuf;
         }
     };
 
@@ -109,6 +107,12 @@ public class RedisPipelineCodec implements Codec
     @Override
     public Encoder getMapKeyEncoder() {
         return getValueEncoder();
+    }
+
+    @Override
+    public ClassLoader getClassLoader()
+    {
+        return innerCodec.getClassLoader();
     }
 
     @Override
